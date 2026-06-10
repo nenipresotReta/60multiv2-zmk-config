@@ -2,6 +2,16 @@
 
 This repository contains ZMK firmware configurations for PH Design keyboards.
 
+## My Layout
+
+HHKB layout & 3+1+3 split spacebar.
+
+<img width="1747" height="761" alt="Screenshot 2026-05-24 at 4 57 31" src="https://github.com/user-attachments/assets/4468ac99-210b-4528-90a7-f933a66a8101" />
+
+<img width="1735" height="631" alt="Screenshot 2026-05-24 at 4 59 32" src="https://github.com/user-attachments/assets/0e44a08c-b054-418e-bbad-059078ab3441" />
+
+<img width="1751" height="645" alt="Screenshot 2026-05-24 at 4 57 57" src="https://github.com/user-attachments/assets/ae1fae52-8361-4a38-bf2f-29ed5eaa9d13" />
+
 ## Download Firmware
 
 1. Go to the **Actions** tab

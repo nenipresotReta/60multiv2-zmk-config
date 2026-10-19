@@ -39,7 +39,7 @@ jobs:
       - name: Restore original board configuration for the baseline
         if: ${{ !matrix.patched }}
         run: |
-          git show 43df72aa4a09b381f6482416e5c31ac15c0308f1:boards/shields/PH60-Multi_V2/PH60-Multi_V2.conf > boards/shields/PH60-Multi_V2/PH60-Multi_V2.conf
+          git -c safe.directory="$GITHUB_WORKSPACE" show 43df72aa4a09b381f6482416e5c31ac15c0308f1:boards/shields/PH60-Multi_V2/PH60-Multi_V2.conf > boards/shields/PH60-Multi_V2/PH60-Multi_V2.conf
       - name: Prepare isolated, pinned manifest
         shell: bash
         run: |
@@ -61,7 +61,7 @@ jobs:
           west update --fetch-opt=--filter=tree:0
           west zephyr-export
           test "$(git -C zmk rev-parse HEAD)" = "$ZMK_REVISION"
-          west manifest --freeze > manifest-frozen.yml
+          west manifest --freeze --active-only > manifest-frozen.yml
       - name: Apply Multi V2 stability fixes
         if: matrix.patched
         working-directory: ${{ env.BUILD_ROOT }}/zmk

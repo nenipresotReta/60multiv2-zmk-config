@@ -16,9 +16,22 @@ HHKB layout & 3+1+3 split spacebar.
 ## Download Firmware
 
 1. Go to the **Actions** tab
-2. Click on a successful build (look for the green checkmark ✓)
-3. Download the firmware file from the **Artifacts** section
-4. Flash it to your keyboard
+2. Open a successful **Build ZMK firmware** run on `v0.3-lts`
+3. Download **PH60-Multi_V2-Stability** from **Artifacts** and extract the ZIP
+4. Flash `PH60-Multi_V2_Stability.uf2` using the keyboard's UF2 bootloader
+
+The default build now applies the Multi V2 stability patch to a pinned ZMK
+revision and runs fault-injection tests before compiling. It also builds
+**PH60-Multi_V2-Stability_Debug** with USB logging and an unpatched
+**PH60-Multi_V2-Baseline** for comparison or rollback. Each artifact contains
+the effective configuration, frozen dependencies, config commit and checksum.
+The active matrix is in `.github/workflows/ble-recovery.yml`; `build.yaml` is
+retained as the legacy upstream matrix.
+
+The fixes retain failed keyboard/media reports, reconcile scan queue overflow,
+retry advertising resource failures and monitor stalled transmissions. Normal
+long holds remain supported. The intermittent Bluetooth issue is still under
+on-device evaluation; see [the stability notes](MULTIV2-STABILITY.txt).
 
 ## About PH-Lite
 

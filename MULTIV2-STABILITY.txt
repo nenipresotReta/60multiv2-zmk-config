@@ -4,7 +4,9 @@ Target: ph_lite + PH60-Multi_V2, existing HHKB keymap, Studio enabled and locked
 This candidate addresses several reproducible paths that can lose a release;
 the cause of the intermittent issue on the user's keyboard is not yet proven.
 
-Artifacts from .github/workflows/ble-recovery.yml:
+The default Build ZMK firmware workflow calls .github/workflows/ble-recovery.yml.
+It applies the patch and runs tests before compiling the patched variants.
+Artifacts:
   Stability: patched firmware, recommended for the first on-device trial.
   Baseline: original board configuration and unpatched ZMK, for comparison/rollback.
   Stability_Debug: the same fixes with USB logging for diagnosis.
@@ -31,8 +33,10 @@ Build sources:
   ph-design/zmk: 76f4effd3d3018c4d2f2568499afb06deac4d3c6
   Patch: patches/0001-multiv2-stability.patch
 Each artifact includes its config commit, frozen dependency manifest, effective
-Kconfig and SHA-256 checksum. Only the candidate workflow applies the patch;
-the original reusable build workflow is excluded on this candidate branch.
+Kconfig and SHA-256 checksum. Both the default workflow and direct builds use
+the same local reusable workflow. Baseline intentionally omits the patch and
+restores the original board configuration. build.yaml is the legacy matrix;
+the active Multi V2 matrix is in .github/workflows/ble-recovery.yml.
 
 Validation:
   Host fault-injection tests compile the production C fragments using mock

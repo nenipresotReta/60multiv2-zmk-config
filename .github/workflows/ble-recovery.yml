@@ -1,5 +1,6 @@
-name: Build Multi V2 stability candidate
+name: Build Multi V2 stability firmware
 on:
+  workflow_call:
   workflow_dispatch:
   push:
     branches: [codex/ble-keyboard-report-recovery]
@@ -86,7 +87,7 @@ jobs:
         working-directory: ${{ env.BUILD_ROOT }}
         run: |
           mkdir -p artifacts
-          cp build/zephyr/zmk.uf2 "artifacts/PH60-Multi_V2_${{ matrix.name }}_20261019.uf2"
+          cp build/zephyr/zmk.uf2 "artifacts/PH60-Multi_V2_${{ matrix.name }}.uf2"
           cp build/zephyr/.config artifacts/effective.config
           cp manifest-frozen.yml artifacts/
           printf '%s\n' "$GITHUB_SHA" > artifacts/config-commit.txt

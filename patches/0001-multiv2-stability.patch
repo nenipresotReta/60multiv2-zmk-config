@@ -1,0 +1,997 @@
+diff --git a/app/Kconfig b/app/Kconfig
+index 6bcdffe..fbf7884 100644
+--- a/app/Kconfig
++++ b/app/Kconfig
+@@ -434,12 +434,13 @@ config ZMK_UNRESPONSE_FIX_TX_STALL_MS
+     depends on ZMK_UNRESPONSE_FIX
+     default 30000
+     help
+-      While the user is active and a link exists (BLE connected / USB
+-      configured), the watchdog stops being fed when either a HID send has
+-      failed and no report has gone out for this long, or reports have been
+-      stuck in the BLE send queues for this long. This catches a wedged hog
+-      work queue, Bluetooth stack or USB stack, and the watchdog then resets
+-      the MCU. Normal typing pauses do not trigger this.
++      While the selected transport is connected, stop feeding if an
++      outstanding BLE report makes no progress for this long (including
++      a blocked send call), or a USB send fails without a later success.
++      Keep checking during the hardware watchdog grace period so a
++      disconnect or recovered transmission can resume feeding. A normal
++      held key or typing pause with no outstanding send does not trigger
++      this timeout; a pending final release is monitored even after idle.
+ 
+ config ZMK_SLEEP
+     bool "Enable deep sleep support"
+diff --git a/app/include/zmk/hog.h b/app/include/zmk/hog.h
+index 0b79dec..18ece6b 100644
+--- a/app/include/zmk/hog.h
++++ b/app/include/zmk/hog.h
+@@ -6,9 +6,15 @@
+ 
+ #pragma once
+ 
++#include <stdbool.h>
++#include <stdint.h>
++
+ #include <zmk/keys.h>
+ #include <zmk/hid.h>
+ 
++/* Outstanding BLE reports include queued, retrying and in-flight sends. */
++bool zmk_hog_tx_stalled(uint32_t timeout_ms);
++
+ int zmk_hog_send_keyboard_report(struct zmk_hid_keyboard_report_body *body);
+ int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *body);
+ 
+diff --git a/app/include/zmk/watchdog.h b/app/include/zmk/watchdog.h
+index afe414a..673a337 100644
+--- a/app/include/zmk/watchdog.h
++++ b/app/include/zmk/watchdog.h
+@@ -9,6 +9,7 @@
+ #if IS_ENABLED(CONFIG_ZMK_UNRESPONSE_FIX)
+ 
+ void zmk_wdt_feed_now(void);
++/* USB HID compatibility hooks. BLE progress is tracked inside HOG. */
+ void zmk_wdt_note_tx_ok(void);
+ void zmk_wdt_note_tx_fail(void);
+ 
+diff --git a/app/src/ble.c b/app/src/ble.c
+index 2611eee..bf9291d 100644
+--- a/app/src/ble.c
++++ b/app/src/ble.c
+@@ -13,6 +13,7 @@
+ #include <stdio.h>
+ 
+ #include <zephyr/settings/settings.h>
++#include <zephyr/sys/atomic.h>
+ #include <zephyr/sys/ring_buffer.h>
+ #include <zephyr/bluetooth/bluetooth.h>
+ #include <zephyr/bluetooth/conn.h>
+@@ -145,11 +146,11 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
+ 
+ #define CHECKED_ADV_STOP()                                                                         \
+     err = bt_le_adv_stop();                                                                        \
+-    advertising_status = ZMK_ADV_NONE;                                                             \
+     if (err) {                                                                                     \
+         LOG_ERR("Failed to stop advertising (err %d)", err);                                       \
+         return err;                                                                                \
+-    }
++    }                                                                                              \
++    advertising_status = ZMK_ADV_NONE;
+ 
+ #define CHECKED_DIR_ADV()                                                                          \
+     addr = zmk_ble_active_profile_addr();                                                          \
+@@ -175,7 +176,7 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
+     }                                                                                              \
+     advertising_status = ZMK_ADV_CONN;
+ 
+-int update_advertising(void) {
++static int update_advertising_once(void) {
+     int err = 0;
+     bt_addr_le_t *addr;
+     struct bt_conn *conn;
+@@ -220,6 +221,44 @@ int update_advertising(void) {
+     return 0;
+ };
+ 
++#define ADV_RETRY_MIN_MS 100
++#define ADV_RETRY_MAX_MS 1000
++
++static atomic_t advertising_update_running;
++static atomic_t advertising_retry_delay_ms = ADV_RETRY_MIN_MS;
++static void advertising_retry_callback(struct k_work *work);
++static K_WORK_DELAYABLE_DEFINE(advertising_retry_work, advertising_retry_callback);
++
++int update_advertising(void) {
++    // A retry can overlap a profile update from the Bluetooth/Studio thread.
++    // Do not wait on a mutex here: the current attempt may itself need that
++    // thread to process an HCI response. Re-evaluate the latest profile later.
++    if (!atomic_cas(&advertising_update_running, 0, 1)) {
++        k_work_schedule(&advertising_retry_work, K_MSEC(ADV_RETRY_MIN_MS));
++        return 0;
++    }
++
++    int err = update_advertising_once();
++    if (err == -ENOMEM || err == -ENOBUFS || err == -EAGAIN || err == -EBUSY) {
++        // ONE_TIME advertising is not restarted by Zephyr when the last
++        // reference to a disconnected connection is released. That reference
++        // can outlive disconnected(), so keep trying after resources recover.
++        int delay = atomic_get(&advertising_retry_delay_ms);
++        atomic_set(&advertising_retry_delay_ms, MIN(delay * 2, ADV_RETRY_MAX_MS));
++        k_work_schedule(&advertising_retry_work, K_MSEC(delay));
++    } else {
++        atomic_set(&advertising_retry_delay_ms, ADV_RETRY_MIN_MS);
++    }
++
++    // Leave an already queued update intact: it may have been requested by a
++    // concurrent profile/connection change while the stack call was running.
++    // A successful retry does not schedule another pass.
++    atomic_clear(&advertising_update_running);
++    return err;
++}
++
++static void advertising_retry_callback(struct k_work *work) { update_advertising(); }
++
+ static void update_advertising_callback(struct k_work *work) { update_advertising(); }
+ 
+ K_WORK_DEFINE(update_advertising_work, update_advertising_callback);
+diff --git a/app/src/hog.c b/app/src/hog.c
+index aba8cef..2b10fc7 100644
+--- a/app/src/hog.c
++++ b/app/src/hog.c
+@@ -15,10 +15,9 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+ #include <zephyr/bluetooth/gatt.h>
+ 
+ #include <zmk/ble.h>
+-#include <zmk/endpoints_types.h>
++#include <zmk/endpoints.h>
+ #include <zmk/hog.h>
+ #include <zmk/hid.h>
+-#include <zmk/watchdog.h>
+ #if IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)
+ #include <zmk/pointing/resolution_multipliers.h>
+ #endif // IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)
+@@ -305,115 +304,240 @@ K_THREAD_STACK_DEFINE(hog_q_stack, CONFIG_ZMK_BLE_THREAD_STACK_SIZE);
+ 
+ struct k_work_q hog_work_q;
+ 
+-K_MSGQ_DEFINE(zmk_hog_keyboard_msgq, sizeof(struct zmk_hid_keyboard_report_body),
+-              CONFIG_ZMK_BLE_KEYBOARD_REPORT_QUEUE_SIZE, 4);
+-
+-void send_keyboard_report_callback(struct k_work *work) {
+-    struct zmk_hid_keyboard_report_body report;
++/* Count reports from enqueue until completion, including the report inside a
++ * blocking bt_gatt_notify_cb(). A nonempty queue alone is not evidence of a
++ * stall: each successful send advances this watermark.
++ */
++struct hog_tx_monitor {
++    struct k_spinlock lock;
++    uint32_t outstanding;
++    uint32_t progress_at;
++};
+ 
+-    while (k_msgq_get(&zmk_hog_keyboard_msgq, &report, K_NO_WAIT) == 0) {
+-        struct bt_conn *conn = zmk_ble_active_profile_conn();
+-        if (conn == NULL) {
+-            return;
+-        }
++static struct hog_tx_monitor keyboard_tx, consumer_tx;
++#if IS_ENABLED(CONFIG_ZMK_POINTING)
++static struct hog_tx_monitor mouse_tx;
++#endif
+ 
+-        struct bt_gatt_notify_params notify_params = {
+-            .attr = &hog_svc.attrs[5],
+-            .data = &report,
+-            .len = sizeof(report),
+-        };
++static void hog_tx_begin(struct hog_tx_monitor *tx) {
++    k_spinlock_key_t key = k_spin_lock(&tx->lock);
++    if (tx->outstanding++ == 0) {
++        tx->progress_at = k_uptime_get_32();
++    }
++    k_spin_unlock(&tx->lock, key);
++}
+ 
+-        int err = bt_gatt_notify_cb(conn, &notify_params);
+-        if (err == -EPERM) {
+-            bt_conn_set_security(conn, BT_SECURITY_L2);
+-        } else if (err) {
+-            LOG_DBG("Error notifying %d", err);
+-            zmk_wdt_note_tx_fail();
+-        } else {
+-            zmk_wdt_note_tx_ok();
+-        }
++static void hog_tx_end(struct hog_tx_monitor *tx) {
++    k_spinlock_key_t key = k_spin_lock(&tx->lock);
++    tx->outstanding--;
++    tx->progress_at = k_uptime_get_32();
++    k_spin_unlock(&tx->lock, key);
++}
+ 
+-        bt_conn_unref(conn);
+-    }
++/* Discarding an overflowed report must not disguise a blocked transmitter. */
++static void hog_tx_discard(struct hog_tx_monitor *tx) {
++    k_spinlock_key_t key = k_spin_lock(&tx->lock);
++    tx->outstanding--;
++    k_spin_unlock(&tx->lock, key);
+ }
+ 
+-K_WORK_DEFINE(hog_keyboard_work, send_keyboard_report_callback);
++static bool hog_tx_is_stalled(struct hog_tx_monitor *tx, uint32_t timeout_ms) {
++    k_spinlock_key_t key = k_spin_lock(&tx->lock);
++    bool stalled = tx->outstanding && k_uptime_get_32() - tx->progress_at >= timeout_ms;
++    k_spin_unlock(&tx->lock, key);
++    return stalled;
++}
+ 
+-int zmk_hog_send_keyboard_report(struct zmk_hid_keyboard_report_body *report) {
+-    int err = k_msgq_put(&zmk_hog_keyboard_msgq, report, K_MSEC(100));
+-    if (err) {
+-        switch (err) {
+-        case -EAGAIN: {
+-            LOG_WRN("Keyboard message queue full, popping first message and queueing again");
+-            struct zmk_hid_keyboard_report_body discarded_report;
+-            k_msgq_get(&zmk_hog_keyboard_msgq, &discarded_report, K_NO_WAIT);
+-            return zmk_hog_send_keyboard_report(report);
+-        }
+-        default:
+-            LOG_WRN("Failed to queue keyboard report to send (%d)", err);
+-            return err;
+-        }
+-    }
++bool zmk_hog_tx_stalled(uint32_t timeout_ms) {
++    return hog_tx_is_stalled(&keyboard_tx, timeout_ms) ||
++           hog_tx_is_stalled(&consumer_tx, timeout_ms)
++#if IS_ENABLED(CONFIG_ZMK_POINTING)
++           || hog_tx_is_stalled(&mouse_tx, timeout_ms)
++#endif
++        ;
++}
+ 
+-    k_work_submit_to_queue(&hog_work_q, &hog_keyboard_work);
++/* Pin each queued state to its original connection. A reference also prevents
++ * reuse of the connection object before obsolete reports have been discarded.
++ */
++struct reliable_report_message {
++    union {
++        struct zmk_hid_keyboard_report_body keyboard;
++        struct zmk_hid_consumer_report_body consumer;
++    } body;
++    struct bt_conn *conn;
++};
+ 
+-    return 0;
++struct reliable_report_sender {
++    struct k_msgq *queue;
++    struct k_work_delayable *work;
++    struct hog_tx_monitor *tx;
++    const struct bt_gatt_attr *attr;
++    size_t report_size;
++    struct k_spinlock enqueue_lock;
++    struct reliable_report_message pending;
++    int64_t retry_deadline;
++    bool security_requested;
+ };
+ 
+-K_MSGQ_DEFINE(zmk_hog_consumer_msgq, sizeof(struct zmk_hid_consumer_report_body),
++K_MSGQ_DEFINE(zmk_hog_keyboard_msgq, sizeof(struct reliable_report_message),
++              CONFIG_ZMK_BLE_KEYBOARD_REPORT_QUEUE_SIZE, 4);
++K_MSGQ_DEFINE(zmk_hog_consumer_msgq, sizeof(struct reliable_report_message),
+               CONFIG_ZMK_BLE_CONSUMER_REPORT_QUEUE_SIZE, 4);
+ 
+-void send_consumer_report_callback(struct k_work *work) {
+-    struct zmk_hid_consumer_report_body report;
++#define HOG_REPORT_RETRY_MS 20
++#define HOG_REPORT_RECOVERY_MS 1000
+ 
+-    while (k_msgq_get(&zmk_hog_consumer_msgq, &report, K_NO_WAIT) == 0) {
+-        struct bt_conn *conn = zmk_ble_active_profile_conn();
+-        if (conn == NULL) {
+-            return;
++static void send_keyboard_report_callback(struct k_work *work);
++static void send_consumer_report_callback(struct k_work *work);
++static K_WORK_DELAYABLE_DEFINE(hog_keyboard_work, send_keyboard_report_callback);
++static K_WORK_DELAYABLE_DEFINE(hog_consumer_work, send_consumer_report_callback);
++
++/* Use the value attributes: declaration attributes have no encryption
++ * permission, so using them bypasses the notification security check.
++ */
++static struct reliable_report_sender keyboard_sender = {
++    .queue = &zmk_hog_keyboard_msgq,
++    .work = &hog_keyboard_work,
++    .tx = &keyboard_tx,
++    .attr = &hog_svc.attrs[6],
++    .report_size = sizeof(struct zmk_hid_keyboard_report_body),
++};
++static struct reliable_report_sender consumer_sender = {
++    .queue = &zmk_hog_consumer_msgq,
++    .work = &hog_consumer_work,
++    .tx = &consumer_tx,
++    .attr = &hog_svc.attrs[10],
++    .report_size = sizeof(struct zmk_hid_consumer_report_body),
++};
++
++static void reliable_report_done(struct reliable_report_sender *sender) {
++    bt_conn_unref(sender->pending.conn);
++    sender->pending.conn = NULL;
++    hog_tx_end(sender->tx);
++}
++
++static void send_reliable_reports(struct reliable_report_sender *sender) {
++    while (true) {
++        if (!sender->pending.conn) {
++            if (k_msgq_get(sender->queue, &sender->pending, K_NO_WAIT)) {
++                return;
++            }
++            sender->retry_deadline = k_uptime_get() + HOG_REPORT_RECOVERY_MS;
++            sender->security_requested = false;
++        }
++
++        struct bt_conn *conn = sender->pending.conn;
++        struct bt_conn_info info;
++        if (bt_conn_get_info(conn, &info) || info.state != BT_CONN_STATE_CONNECTED) {
++            reliable_report_done(sender);
++            continue;
+         }
+ 
+         struct bt_gatt_notify_params notify_params = {
+-            .attr = &hog_svc.attrs[9],
+-            .data = &report,
+-            .len = sizeof(report),
++            .attr = sender->attr,
++            .data = &sender->pending.body,
++            .len = sender->report_size,
+         };
+-
+         int err = bt_gatt_notify_cb(conn, &notify_params);
+-        if (err == -EPERM) {
+-            bt_conn_set_security(conn, BT_SECURITY_L2);
+-        } else if (err) {
+-            LOG_DBG("Error notifying %d", err);
+-            zmk_wdt_note_tx_fail();
+-        } else {
+-            zmk_wdt_note_tx_ok();
++        if (!err) {
++            reliable_report_done(sender);
++            continue;
+         }
+ 
+-        bt_conn_unref(conn);
++        LOG_DBG("HID notification failed (%d), retaining report", err);
++        if (err == -EPERM && !sender->security_requested) {
++            sender->security_requested = true;
++            int security_err = bt_conn_set_security(conn, BT_SECURITY_L2);
++            if (security_err) {
++                LOG_WRN("HID security request failed (%d)", security_err);
++            }
++        }
++
++        if (k_uptime_get() >= sender->retry_deadline) {
++            int disconnect_err = bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
++            if (!disconnect_err || disconnect_err == -ENOTCONN) {
++                LOG_WRN("HID notification recovery timed out; ending connection");
++                reliable_report_done(sender);
++                continue;
++            }
++            LOG_WRN("HID recovery disconnect failed (%d); retaining report", disconnect_err);
++        }
++
++        /* Retain FIFO ordering without sleeping on the shared HOG work queue.
++         * A blocked notify call is detected separately by zmk_hog_tx_stalled().
++         */
++        k_work_reschedule_for_queue(&hog_work_q, sender->work, K_MSEC(HOG_REPORT_RETRY_MS));
++        return;
+     }
+-};
++}
+ 
+-K_WORK_DEFINE(hog_consumer_work, send_consumer_report_callback);
++static int queue_reliable_report(struct reliable_report_sender *sender, const void *report) {
++    /* Endpoint switching clears the OLD endpoint before changing it, although
++     * active_profile may already refer to the new host at this point.
++     */
++    struct zmk_endpoint_instance endpoint = zmk_endpoints_selected();
++    if (endpoint.transport != ZMK_TRANSPORT_BLE) {
++        return -ENOTCONN;
++    }
++    bt_addr_le_t *addr = zmk_ble_profile_address(endpoint.ble.profile_index);
++    if (!bt_addr_le_cmp(addr, BT_ADDR_LE_ANY)) {
++        return -ENOTCONN;
++    }
++    struct bt_conn *conn = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr);
++    if (!conn) {
++        return -ENOTCONN;
++    }
+ 
+-int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *report) {
+-    int err = k_msgq_put(&zmk_hog_consumer_msgq, report, K_MSEC(100));
++    struct reliable_report_message message = {.conn = conn};
++    memcpy(&message.body, report, sender->report_size);
++    struct reliable_report_message discarded = {0};
++    hog_tx_begin(sender->tx);
++    k_spinlock_key_t key = k_spin_lock(&sender->enqueue_lock);
++    int err = k_msgq_put(sender->queue, &message, K_NO_WAIT);
+     if (err) {
+-        switch (err) {
+-        case -EAGAIN: {
+-            LOG_WRN("Consumer message queue full, popping first message and queueing again");
+-            struct zmk_hid_consumer_report_body discarded_report;
+-            k_msgq_get(&zmk_hog_consumer_msgq, &discarded_report, K_NO_WAIT);
+-            return zmk_hog_send_consumer_report(report);
+-        }
+-        default:
+-            LOG_WRN("Failed to queue consumer report to send (%d)", err);
+-            return err;
++        /* Reports contain full state; preserve the latest release on overflow. */
++        k_msgq_get(sender->queue, &discarded, K_NO_WAIT);
++        err = k_msgq_put(sender->queue, &message, K_NO_WAIT);
++    }
++    k_spin_unlock(&sender->enqueue_lock, key);
++
++    if (discarded.conn) {
++        hog_tx_discard(sender->tx);
++        LOG_WRN("HID message queue full, replacing oldest queued state");
++        if (discarded.conn != conn) {
++            /* A state for a different host cannot repair the old host. */
++            int disconnect_err =
++                bt_conn_disconnect(discarded.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
++            if (disconnect_err && disconnect_err != -ENOTCONN) {
++                LOG_ERR("Failed to disconnect overflowed HID endpoint (%d)", disconnect_err);
++            }
+         }
++        bt_conn_unref(discarded.conn);
++    }
++    if (err) {
++        hog_tx_discard(sender->tx);
++        bt_conn_unref(conn);
++        return err;
+     }
+ 
+-    k_work_submit_to_queue(&hog_work_q, &hog_consumer_work);
+-
++    k_work_schedule_for_queue(&hog_work_q, sender->work, K_NO_WAIT);
+     return 0;
+-};
++}
++
++static void send_keyboard_report_callback(struct k_work *work) {
++    send_reliable_reports(&keyboard_sender);
++}
++static void send_consumer_report_callback(struct k_work *work) {
++    send_reliable_reports(&consumer_sender);
++}
++
++int zmk_hog_send_keyboard_report(struct zmk_hid_keyboard_report_body *report) {
++    return queue_reliable_report(&keyboard_sender, report);
++}
++int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *report) {
++    return queue_reliable_report(&consumer_sender, report);
++}
+ 
+ #if IS_ENABLED(CONFIG_ZMK_POINTING)
+ 
+@@ -425,11 +549,12 @@ void send_mouse_report_callback(struct k_work *work) {
+     while (k_msgq_get(&zmk_hog_mouse_msgq, &report, K_NO_WAIT) == 0) {
+         struct bt_conn *conn = zmk_ble_active_profile_conn();
+         if (conn == NULL) {
+-            return;
++            hog_tx_end(&mouse_tx);
++            continue;
+         }
+ 
+         struct bt_gatt_notify_params notify_params = {
+-            .attr = &hog_svc.attrs[13],
++            .attr = &hog_svc.attrs[14],
+             .data = &report,
+             .len = sizeof(report),
+         };
+@@ -439,37 +564,33 @@ void send_mouse_report_callback(struct k_work *work) {
+             bt_conn_set_security(conn, BT_SECURITY_L2);
+         } else if (err) {
+             LOG_DBG("Error notifying %d", err);
+-            zmk_wdt_note_tx_fail();
+-        } else {
+-            zmk_wdt_note_tx_ok();
+         }
+-
+         bt_conn_unref(conn);
++        hog_tx_end(&mouse_tx);
+     }
+-};
++}
+ 
+ K_WORK_DEFINE(hog_mouse_work, send_mouse_report_callback);
+ 
+ int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
++    hog_tx_begin(&mouse_tx);
+     int err = k_msgq_put(&zmk_hog_mouse_msgq, report, K_MSEC(100));
+     if (err) {
+-        switch (err) {
+-        case -EAGAIN: {
+-            LOG_WRN("Consumer message queue full, popping first message and queueing again");
++        hog_tx_discard(&mouse_tx);
++        if (err == -EAGAIN) {
++            LOG_WRN("Mouse message queue full, popping first message and queueing again");
+             struct zmk_hid_mouse_report_body discarded_report;
+-            k_msgq_get(&zmk_hog_mouse_msgq, &discarded_report, K_NO_WAIT);
++            if (!k_msgq_get(&zmk_hog_mouse_msgq, &discarded_report, K_NO_WAIT)) {
++                hog_tx_discard(&mouse_tx);
++            }
+             return zmk_hog_send_mouse_report(report);
+         }
+-        default:
+-            LOG_WRN("Failed to queue mouse report to send (%d)", err);
+-            return err;
+-        }
++        LOG_WRN("Failed to queue mouse report to send (%d)", err);
++        return err;
+     }
+-
+     k_work_submit_to_queue(&hog_work_q, &hog_mouse_work);
+-
+     return 0;
+-};
++}
+ #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
+ 
+ static int zmk_hog_init(void) {
+diff --git a/app/src/physical_layouts.c b/app/src/physical_layouts.c
+index 8d38430..2103177 100644
+--- a/app/src/physical_layouts.c
++++ b/app/src/physical_layouts.c
+@@ -9,6 +9,7 @@
+ #include <zephyr/pm/device.h>
+ #include <zephyr/pm/device_runtime.h>
+ #include <zephyr/drivers/kscan.h>
++#include <string.h>
+ 
+ #if IS_ENABLED(CONFIG_SETTINGS)
+ #include <zephyr/settings/settings.h>
+@@ -168,8 +169,7 @@ size_t zmk_physical_layouts_get_list(struct zmk_physical_layout const *const **d
+ #define ZMK_KSCAN_EVENT_STATE_RELEASED 1
+ 
+ struct zmk_kscan_event {
+-    uint32_t row;
+-    uint32_t column;
++    uint32_t position;
+     uint32_t state;
+ };
+ 
+@@ -180,43 +180,129 @@ static struct zmk_kscan_msg_processor {
+ K_MSGQ_DEFINE(physical_layouts_kscan_msgq, sizeof(struct zmk_kscan_event),
+               CONFIG_ZMK_KSCAN_EVENT_QUEUE_SIZE, 4);
+ 
++/* Keep the last physical state even when the edge queue is full. Once an edge
++ * is lost, retain the queued prefix but stop appending edges until the worker
++ * has reconciled a snapshot. This keeps later presses from overtaking a lost
++ * release. Only the worker emits position events, including recovery events,
++ * so hold-taps, combos and momentary layers see the same release path as keys.
++ */
++static struct k_spinlock scan_state_lock;
++static bool scan_latest_state[ZMK_KEYMAP_LEN];
++static bool scan_reported_state[ZMK_KEYMAP_LEN];
++static bool scan_overflowed;
++static bool scan_processing;
++static bool scan_accepting;
++
+ static void zmk_physical_layout_kscan_callback(const struct device *dev, uint32_t row,
+                                                uint32_t column, bool pressed) {
+-    if (dev != active->kscan) {
++    k_spinlock_key_t key = k_spin_lock(&scan_state_lock);
++    if (!scan_accepting || dev != active->kscan) {
++        k_spin_unlock(&scan_state_lock, key);
+         return;
+     }
+ 
+-    struct zmk_kscan_event ev = {
+-        .row = row,
+-        .column = column,
+-        .state = (pressed ? ZMK_KSCAN_EVENT_STATE_PRESSED : ZMK_KSCAN_EVENT_STATE_RELEASED)};
++    /* Resolve against the layout that accepted this edge, never a later one. */
++    int32_t position = zmk_matrix_transform_row_column_to_position(active->matrix_transform,
++                                                                  row, column);
++    if (position < 0 || (uint32_t)position >= ZMK_KEYMAP_LEN) {
++        k_spin_unlock(&scan_state_lock, key);
++        LOG_WRN("Not found in transform: row: %d, col: %d, pressed: %s", row, column,
++                pressed ? "true" : "false");
++        return;
++    }
+ 
+-    k_msgq_put(&physical_layouts_kscan_msgq, &ev, K_NO_WAIT);
++    scan_latest_state[position] = pressed;
++    if (!scan_overflowed) {
++        struct zmk_kscan_event ev = {
++            .position = position,
++            .state = pressed ? ZMK_KSCAN_EVENT_STATE_PRESSED : ZMK_KSCAN_EVENT_STATE_RELEASED};
++        if (k_msgq_put(&physical_layouts_kscan_msgq, &ev, K_NO_WAIT) != 0) {
++            scan_overflowed = true;
++        }
++    }
++    k_spin_unlock(&scan_state_lock, key);
+     k_work_submit(&msg_processor.work);
+ }
+ 
++static void zmk_physical_layouts_report_state(uint32_t position, bool pressed) {
++    if (scan_reported_state[position] == pressed) {
++        return;
++    }
++    scan_reported_state[position] = pressed;
++    LOG_DBG("Position: %d, pressed: %s", position, pressed ? "true" : "false");
++    raise_zmk_position_state_changed(
++        (struct zmk_position_state_changed){.source = ZMK_POSITION_STATE_CHANGE_SOURCE_LOCAL,
++                                            .state = pressed,
++                                            .position = position,
++                                            .timestamp = k_uptime_get()});
++}
++
+ static void zmk_physical_layouts_kscan_process_msgq(struct k_work *item) {
+     struct zmk_kscan_event ev;
++    bool snapshot[ZMK_KEYMAP_LEN];
+ 
+-    while (k_msgq_get(&physical_layouts_kscan_msgq, &ev, K_NO_WAIT) == 0) {
+-        bool pressed = (ev.state == ZMK_KSCAN_EVENT_STATE_PRESSED);
+-        int32_t position = zmk_matrix_transform_row_column_to_position(active->matrix_transform,
+-                                                                       ev.row, ev.column);
+-
+-        if (position < 0) {
+-            LOG_WRN("Not found in transform: row: %d, col: %d, pressed: %s", ev.row, ev.column,
+-                    (pressed ? "true" : "false"));
++    k_spinlock_key_t key = k_spin_lock(&scan_state_lock);
++    if (!scan_accepting) {
++        k_spin_unlock(&scan_state_lock, key);
++        return;
++    }
++    scan_processing = true;
++    k_spin_unlock(&scan_state_lock, key);
++
++    while (true) {
++        key = k_spin_lock(&scan_state_lock);
++        if (k_msgq_get(&physical_layouts_kscan_msgq, &ev, K_NO_WAIT) == 0) {
++            k_spin_unlock(&scan_state_lock, key);
++            zmk_physical_layouts_report_state(ev.position,
++                                               ev.state == ZMK_KSCAN_EVENT_STATE_PRESSED);
+             continue;
+         }
+ 
+-        LOG_DBG("Row: %d, col: %d, position: %d, pressed: %s", ev.row, ev.column, position,
+-                (pressed ? "true" : "false"));
+-        raise_zmk_position_state_changed(
+-            (struct zmk_position_state_changed){.source = ZMK_POSITION_STATE_CHANGE_SOURCE_LOCAL,
+-                                                .state = pressed,
+-                                                .position = position,
+-                                                .timestamp = k_uptime_get()});
++        if (!scan_overflowed) {
++            scan_processing = false;
++            k_spin_unlock(&scan_state_lock, key);
++            return;
++        }
++
++        memcpy(snapshot, scan_latest_state, sizeof(snapshot));
++        scan_overflowed = false;
++        k_spin_unlock(&scan_state_lock, key);
++
++        LOG_WRN("Kscan queue overflow: restoring key state; intervening taps may be lost");
++        /* Releases first avoid carrying a stale modifier/layer into new presses.
++         * Edges accepted after the snapshot remain queued behind this recovery.
++         */
++        for (int position = 0; position < ZMK_KEYMAP_LEN; position++) {
++            if (!snapshot[position]) {
++                zmk_physical_layouts_report_state(position, false);
++            }
++        }
++        for (int position = 0; position < ZMK_KEYMAP_LEN; position++) {
++            if (snapshot[position]) {
++                zmk_physical_layouts_report_state(position, true);
++            }
++        }
++    }
++}
++
++static int zmk_physical_layouts_pause_scan(void) {
++    k_spinlock_key_t key = k_spin_lock(&scan_state_lock);
++    if (active) {
++        if (!scan_accepting || scan_processing || scan_overflowed ||
++            k_msgq_num_used_get(&physical_layouts_kscan_msgq) != 0) {
++            k_spin_unlock(&scan_state_lock, key);
++            return -EBUSY;
++        }
++        for (int position = 0; position < ZMK_KEYMAP_LEN; position++) {
++            if (scan_latest_state[position] || scan_reported_state[position]) {
++                k_spin_unlock(&scan_state_lock, key);
++                return -EBUSY;
++            }
++        }
+     }
++    scan_accepting = false;
++    k_spin_unlock(&scan_state_lock, key);
++    return 0;
+ }
+ 
+ static const struct zmk_physical_layout *get_default_layout(void) {
+@@ -257,6 +343,25 @@ int zmk_physical_layouts_select_layout(const struct zmk_physical_layout *dest_la
+         return 0;
+     }
+ 
++    int new_idx = get_index_of_layout(dest_layout);
++    int stock_idx = get_index_of_layout(get_default_layout());
++    uint32_t new_position_map[ZMK_KEYMAP_LEN];
++    int ret = zmk_physical_layouts_get_position_map(stock_idx, new_idx, ZMK_KEYMAP_LEN,
++                                                    new_position_map);
++    if (ret < 0) {
++        LOG_ERR("Failed to refresh the selected to stock mapping (%d)", ret);
++        return ret;
++    }
++
++    /* Do not reinterpret queued edges or release held behaviors through a new
++     * layout. Studio may retry after all keys and pending scan work are released.
++     * No driver/PM call or event dispatch is made while holding scan_state_lock.
++     */
++    ret = zmk_physical_layouts_pause_scan();
++    if (ret < 0) {
++        return ret;
++    }
++
+     if (active) {
+         if (active->kscan) {
+             kscan_disable_callback(active->kscan);
+@@ -268,28 +373,36 @@ int zmk_physical_layouts_select_layout(const struct zmk_physical_layout *dest_la
+         }
+     }
+ 
+-    int new_idx = get_index_of_layout(dest_layout);
+-    int stock_idx = get_index_of_layout(get_default_layout());
+-    int ret = zmk_physical_layouts_get_position_map(stock_idx, new_idx, ZMK_KEYMAP_LEN,
+-                                                    selected_to_stock_map);
+-    if (ret < 0) {
+-        LOG_ERR("Failed to refresh the selected to stock mapping (%d)", ret);
+-        return ret;
+-    }
+-
+-    active = dest_layout;
+-
+-    if (active->kscan) {
++    if (dest_layout->kscan) {
+ #if IS_ENABLED(CONFIG_PM_DEVICE_RUNTIME)
+-        int err = pm_device_runtime_get(active->kscan);
++        int err = pm_device_runtime_get(dest_layout->kscan);
+         if (err < 0) {
+             LOG_WRN("PM runtime get of kscan device to enable it %d", err);
++            if (active && active->kscan) {
++                pm_device_runtime_get(active->kscan);
++                k_spinlock_key_t key = k_spin_lock(&scan_state_lock);
++                scan_accepting = true;
++                k_spin_unlock(&scan_state_lock, key);
++                kscan_enable_callback(active->kscan);
++            }
+             return err;
+         }
+ #elif IS_ENABLED(CONFIG_PM_DEVICE)
+-        pm_device_action_run(active->kscan, PM_DEVICE_ACTION_RESUME);
++        pm_device_action_run(dest_layout->kscan, PM_DEVICE_ACTION_RESUME);
+ #endif
+-        kscan_config(active->kscan, zmk_physical_layout_kscan_callback);
++        kscan_config(dest_layout->kscan, zmk_physical_layout_kscan_callback);
++    }
++
++    k_spinlock_key_t key = k_spin_lock(&scan_state_lock);
++    active = dest_layout;
++    memcpy(selected_to_stock_map, new_position_map, sizeof(selected_to_stock_map));
++    memset(scan_latest_state, 0, sizeof(scan_latest_state));
++    memset(scan_reported_state, 0, sizeof(scan_reported_state));
++    scan_overflowed = false;
++    scan_accepting = true;
++    k_spin_unlock(&scan_state_lock, key);
++
++    if (active->kscan) {
+         kscan_enable_callback(active->kscan);
+     }
+ 
+@@ -402,7 +515,7 @@ int zmk_physical_layouts_get_position_map(uint8_t source, uint8_t dest, size_t m
+         return -EINVAL;
+     }
+ 
+-    memset(map, UINT32_MAX, map_size);
++    memset(map, UINT32_MAX, map_size * sizeof(*map));
+ 
+     for (int b = 0; b < max_kp; b++) {
+         bool found = false;
+diff --git a/app/src/watchdog.c b/app/src/watchdog.c
+index e94eeb6..ac7699f 100644
+--- a/app/src/watchdog.c
++++ b/app/src/watchdog.c
+@@ -8,13 +8,11 @@
+ #include <zephyr/drivers/watchdog.h>
+ #include <zephyr/kernel.h>
+ #include <zephyr/init.h>
+-#include <zephyr/sys/atomic.h>
+ #include <hal/nrf_wdt.h>
+ 
+ #include <zephyr/logging/log.h>
+ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+ 
+-#include <zmk/activity.h>
+ #include <zmk/endpoints.h>
+ #if IS_ENABLED(CONFIG_ZMK_USB)
+ #include <zephyr/usb/usb_device.h>
+@@ -22,27 +20,19 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+ #endif
+ #if IS_ENABLED(CONFIG_ZMK_BLE)
+ #include <zmk/ble.h>
+-
+-extern struct k_msgq zmk_hog_keyboard_msgq;
+-extern struct k_msgq zmk_hog_consumer_msgq;
+-#if IS_ENABLED(CONFIG_ZMK_POINTING)
+-extern struct k_msgq zmk_hog_mouse_msgq;
+-#endif
++#include <zmk/hog.h>
+ #endif
+ 
+ #define WDT_REG ((NRF_WDT_Type *)DT_REG_ADDR(DT_NODELABEL(wdt0)))
+ 
+ static const struct device *const wdt = DEVICE_DT_GET(DT_NODELABEL(wdt0));
+ static int wdt_channel = -1;
+-// Armed when a transmission failed and no successful one followed; the window
+-// starts at the first failure and is cleared by the next success.
+-static atomic_t tx_stall_armed;
+-static volatile uint32_t tx_stall_start;
+-static volatile uint32_t tx_last_fail_at;
+-// Watermark refreshed whenever the BLE report queues are observed empty.
+-static int64_t tx_idle_since;
+-
+-#define TX_FAIL_FRESH_MS 5000
++/* Legacy USB send failures: the window begins at the first failure and is
++ * cleared only by success or by leaving the connected USB endpoint.
++ */
++static struct k_spinlock tx_failure_lock;
++static bool tx_failed;
++static uint32_t tx_failed_at;
+ 
+ static void wdt_feed_handler(struct k_work *work);
+ 
+@@ -54,88 +44,62 @@ void zmk_wdt_feed_now(void) {
+     }
+ }
+ 
+-void zmk_wdt_note_tx_ok(void) { atomic_set(&tx_stall_armed, 0); }
++void zmk_wdt_note_tx_ok(void) {
++    k_spinlock_key_t key = k_spin_lock(&tx_failure_lock);
++    tx_failed = false;
++    k_spin_unlock(&tx_failure_lock, key);
++}
+ 
+ void zmk_wdt_note_tx_fail(void) {
+-    uint32_t now = k_uptime_get_32();
+-    if (!atomic_get(&tx_stall_armed) ||
+-        now - tx_stall_start > CONFIG_ZMK_UNRESPONSE_FIX_TX_STALL_MS) {
+-        tx_stall_start = now;
+-        atomic_set(&tx_stall_armed, 1);
++    k_spinlock_key_t key = k_spin_lock(&tx_failure_lock);
++    if (!tx_failed) {
++        tx_failed_at = k_uptime_get_32();
++        tx_failed = true;
+     }
+-    tx_last_fail_at = now;
++    k_spin_unlock(&tx_failure_lock, key);
+ }
+ 
+-static bool transport_link_up(void) {
+ #if IS_ENABLED(CONFIG_ZMK_USB)
+-    if (zmk_endpoints_selected().transport == ZMK_TRANSPORT_USB) {
+-        return zmk_usb_get_status() == USB_DC_CONFIGURED;
+-    }
+-#endif
+-#if IS_ENABLED(CONFIG_ZMK_BLE)
+-    return zmk_ble_active_profile_is_connected();
+-#else
+-    return false;
+-#endif
++static bool usb_tx_stalled(void) {
++    k_spinlock_key_t key = k_spin_lock(&tx_failure_lock);
++    bool stalled = tx_failed &&
++                   k_uptime_get_32() - tx_failed_at >= CONFIG_ZMK_UNRESPONSE_FIX_TX_STALL_MS;
++    k_spin_unlock(&tx_failure_lock, key);
++    return stalled;
+ }
+ 
+-static bool ble_selected_and_connected(void) {
+-#if IS_ENABLED(CONFIG_ZMK_BLE)
+-    return zmk_endpoints_selected().transport == ZMK_TRANSPORT_BLE &&
+-           zmk_ble_active_profile_is_connected();
+-#else
+-    return false;
+ #endif
+-}
+ 
++static bool transport_tx_stalled(void) {
++    struct zmk_endpoint_instance endpoint = zmk_endpoints_selected();
++#if IS_ENABLED(CONFIG_ZMK_USB)
++    if (endpoint.transport == ZMK_TRANSPORT_USB &&
++        zmk_usb_get_status() == USB_DC_CONFIGURED) {
++        return usb_tx_stalled();
++    }
++#endif
++    zmk_wdt_note_tx_ok();
+ #if IS_ENABLED(CONFIG_ZMK_BLE)
+-static bool hog_reports_pending(void) {
+-    if (k_msgq_num_used_get(&zmk_hog_keyboard_msgq) > 0 ||
+-        k_msgq_num_used_get(&zmk_hog_consumer_msgq) > 0) {
+-        return true;
++    if (endpoint.transport == ZMK_TRANSPORT_BLE && zmk_ble_active_profile_is_connected()) {
++        return zmk_hog_tx_stalled(CONFIG_ZMK_UNRESPONSE_FIX_TX_STALL_MS);
+     }
+-#if IS_ENABLED(CONFIG_ZMK_POINTING)
+-    return k_msgq_num_used_get(&zmk_hog_mouse_msgq) > 0;
+-#else
+-    return false;
+ #endif
++    return false;
+ }
+-#else
+-static bool hog_reports_pending(void) { return false; }
+-#endif
+ 
+-// Feeding
+ static void wdt_feed_handler(struct k_work *work) {
+-    int64_t now = k_uptime_get();
+-
+-    if (!hog_reports_pending()) {
+-        tx_idle_since = now;
+-    }
+-
+-    bool active = zmk_activity_get_state() == ZMK_ACTIVITY_ACTIVE;
+-    if (!active) {
+-        // Drop a stall armed before idle so it cannot fire after the idle boundary.
+-        atomic_set(&tx_stall_armed, 0);
+-    }
+-
+-    // Only judge while the user is actually using the keyboard and a link exists.
+-    if (active && transport_link_up()) {
+-        uint32_t now32 = k_uptime_get_32();
+-        // Sends keep failing and none has gone out for the whole window.
+-        bool stalled = atomic_get(&tx_stall_armed) && now32 - tx_last_fail_at < TX_FAIL_FRESH_MS &&
+-                       now32 - tx_stall_start > CONFIG_ZMK_UNRESPONSE_FIX_TX_STALL_MS;
+-        // Reports are stuck in the BLE queues: the hog work queue is wedged.
+-        stalled = stalled || (ble_selected_and_connected() && hog_reports_pending() &&
+-                              now - tx_idle_since > CONFIG_ZMK_UNRESPONSE_FIX_TX_STALL_MS);
+-
+-        if (stalled) {
+-            // Stop feeding and let the WDT reset us.
+-            LOG_ERR("HID transport stalled, stop feeding the watchdog");
+-            return;
+-        }
++    /* Pending TX, rather than activity state, matters here: a lost final release
++     * still needs recovery after the user stops typing. Holding a key normally
++     * has no outstanding TX after its press has been accepted.
++     */
++    if (transport_tx_stalled()) {
++        LOG_ERR("HID transport stalled, stop feeding the watchdog");
++    } else {
++        zmk_wdt_feed_now();
+     }
+-
+-    zmk_wdt_feed_now();
++    /* Keep checking: a disconnect or genuine progress during the hardware
++     * watchdog grace period can still recover without resetting the MCU.
++     */
+     k_work_schedule(&wdt_feed_work, K_SECONDS(1));
+ }
+ 
+@@ -145,8 +109,7 @@ static int zmk_wdt_init(void) {
+     }
+ 
+     if (nrf_wdt_started_check(WDT_REG)) {
+-        // On nRF52 the WDT is not reset by a System OFF wake or warm reset and
+-        // its config registers are locked once started; just reload and keep feeding.
++        // If the bootloader already started the watchdog, reuse its channel.
+         wdt_channel = 0;
+     } else {
+         struct wdt_timeout_cfg cfg = {
+@@ -168,7 +131,6 @@ static int zmk_wdt_init(void) {
+ 
+     // Feed immediately: nothing feeds the WDT between reset and this init during boot
+     zmk_wdt_feed_now();
+-    tx_idle_since = k_uptime_get();
+     k_work_schedule(&wdt_feed_work, K_SECONDS(1));
+     return 0;
+ }

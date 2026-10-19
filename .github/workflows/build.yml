@@ -1,6 +1,14 @@
 name: Build ZMK firmware
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: [v0.3-lts]
+  pull_request:
+    branches: [v0.3-lts]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    uses: zmkfirmware/zmk/.github/workflows/build-user-config.yml@v0.3
+    uses: ./.github/workflows/ble-recovery.yml

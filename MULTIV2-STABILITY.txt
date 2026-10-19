@@ -1,0 +1,60 @@
+PH60-Multi V2 stability candidate — 2026-10-19
+
+Target: ph_lite + PH60-Multi_V2, existing HHKB keymap, Studio enabled and locked.
+This candidate addresses several reproducible paths that can lose a release;
+the cause of the intermittent issue on the user's keyboard is not yet proven.
+
+The default Build ZMK firmware workflow calls .github/workflows/ble-recovery.yml.
+It applies the patch and runs tests before compiling the patched variants.
+Artifacts:
+  Stability: patched firmware, recommended for the first on-device trial.
+  Baseline: original board configuration and unpatched ZMK, for comparison/rollback.
+  Stability_Debug: the same fixes with USB logging for diagnosis.
+These are normal application UF2 files, not settings-reset images.
+
+Changes:
+  - Keep keyboard and consumer reports in order across failed BLE sends, tied
+    to their original connection. Retry every 20 ms; request a disconnect after
+    1 s of failure so the host can clear stale pressed state. If disconnect also
+    fails, retain the report for retry. Use encrypted HID value attributes.
+  - Detect outstanding sends with no progress, including a blocked send call.
+    Normal held keys have no pending report after their press is accepted;
+    there is no forced key-release timer and normal long holds remain supported.
+  - Enlarge the scan queue to 75. On overflow, drain ordered events then reconcile
+    the latest physical state through the normal position event path. A complete
+    very short tap during overflow can still be lost, but a final release is
+    no longer silently discarded. Layout changes require a quiescent keyboard.
+  - Retry advertising after temporary Bluetooth resource errors, with bounded
+    backoff, using the latest selected profile.
+Keymap, debounce settings and BLE connection timing are unchanged.
+
+Build sources:
+  Config baseline: 43df72aa4a09b381f6482416e5c31ac15c0308f1
+  ph-design/zmk: 76f4effd3d3018c4d2f2568499afb06deac4d3c6
+  Patch: patches/0001-multiv2-stability.patch
+Each artifact includes its config commit, frozen dependency manifest, effective
+Kconfig and SHA-256 checksum. Both the default workflow and direct builds use
+the same local reusable workflow. Baseline intentionally omits the patch and
+restores the original board configuration. build.yaml is the legacy matrix;
+the active Multi V2 matrix is in .github/workflows/ble-recovery.yml.
+
+Validation:
+  Host fault-injection tests compile the production C fragments using mock
+  Zephyr/Bluetooth APIs, with AddressSanitizer and UndefinedBehaviorSanitizer.
+  They cover failures, queue overflow, profile changes, reconnection, normal
+  holds and watchdog progress. They do not simulate the radio or kernel fully.
+  GitHub Actions compiles the complete firmware for all three artifact variants.
+  Hardware testing is still required; successful compilation is not proof that
+  the intermittent symptom is eliminated.
+
+On-device trial:
+  1. Keep the Baseline UF2 for rollback. Flash Stability using the keyboard's
+     existing UF2 bootloader procedure. Do not run settings-reset or clear bonds
+     as part of this initial comparison.
+  2. Check normal typing, held letters/backspace/arrows, modifiers and layers,
+     media keys, Bluetooth profile switching, sleep/wake and USB operation.
+  3. If repetition returns, record the time, whether another key stops it,
+     whether the keyboard disconnects/reconnects, and whether USB is affected.
+     Use Stability_Debug for a subsequent diagnostic run if needed.
+  4. Reflash Baseline if the candidate introduces a regression. Existing stored
+     settings can override the compiled default keymap in all three builds.

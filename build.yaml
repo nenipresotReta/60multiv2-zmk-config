@@ -1,4 +1,6 @@
-# This file generates the GitHub Actions matrix.
+# Legacy matrix for the upstream reusable workflow. The active Multi V2 build
+# uses .github/workflows/ble-recovery.yml, including the stability patch and
+# fault-injection tests. Edit that workflow to change the active build matrix.
 # For simple board + shield combinations, add them to the top level board and
 # shield arrays, for more control, add individual board + shield combinations
 # to the `include` property. You can also use the `cmake-args` property to

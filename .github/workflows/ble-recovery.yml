@@ -1,0 +1,98 @@
+name: Build Multi V2 stability firmware
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches: [codex/ble-keyboard-report-recovery]
+    paths:
+      - .github/workflows/ble-recovery.yml
+      - boards/shields/PH60-Multi_V2/**
+      - patches/**
+      - tests/**
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: zmkfirmware/zmk-build-arm:stable
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Baseline
+            patched: false
+            snippets: studio-rpc-usb-uart
+          - name: Stability
+            patched: true
+            snippets: studio-rpc-usb-uart
+          - name: Stability_Debug
+            patched: true
+            snippets: studio-rpc-usb-uart;zmk-usb-logging
+    env:
+      BUILD_ROOT: /tmp/ble-recovery
+      ZMK_REVISION: 76f4effd3d3018c4d2f2568499afb06deac4d3c6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Restore original board configuration for the baseline
+        if: ${{ !matrix.patched }}
+        run: |
+          git -c safe.directory="$GITHUB_WORKSPACE" show 43df72aa4a09b381f6482416e5c31ac15c0308f1:boards/shields/PH60-Multi_V2/PH60-Multi_V2.conf > boards/shields/PH60-Multi_V2/PH60-Multi_V2.conf
+      - name: Prepare isolated, pinned manifest
+        shell: bash
+        run: |
+          mkdir -p "$BUILD_ROOT/config"
+          cp -R config/. "$BUILD_ROOT/config/"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          p = Path(os.environ['BUILD_ROOT']) / 'config/west.yml'
+          s = p.read_text()
+          old = 'revision: v0.3-lts'
+          assert s.count(old) == 1, 'Review manifest before rebasing recovery patch'
+          p.write_text(s.replace(old, 'revision: ' + os.environ['ZMK_REVISION']))
+          PY
+      - name: Fetch dependencies
+        working-directory: ${{ env.BUILD_ROOT }}
+        run: |
+          west init -l config
+          west update --fetch-opt=--filter=tree:0
+          west zephyr-export
+          test "$(git -C zmk rev-parse HEAD)" = "$ZMK_REVISION"
+          west manifest --freeze --active-only > manifest-frozen.yml
+      - name: Apply Multi V2 stability fixes
+        if: matrix.patched
+        working-directory: ${{ env.BUILD_ROOT }}/zmk
+        run: |
+          git apply --check "$GITHUB_WORKSPACE/patches/0001-multiv2-stability.patch"
+          git apply "$GITHUB_WORKSPACE/patches/0001-multiv2-stability.patch"
+      - name: Run fault-injection tests on patched source
+        if: matrix.patched
+        run: |
+          python3 tests/ble-recovery/run.py "$BUILD_ROOT/zmk/app/src/hog.c"
+          python3 tests/ble-advertising/run.py "$BUILD_ROOT/zmk"
+          python3 tests/scan-recovery/run.py "$BUILD_ROOT/zmk"
+      - name: Build firmware
+        working-directory: ${{ env.BUILD_ROOT }}
+        run: |
+          west build -s zmk/app -d build -b ph_lite -S "${{ matrix.snippets }}" -- \
+            -DZMK_CONFIG="$BUILD_ROOT/config" \
+            -DZMK_EXTRA_MODULES="$GITHUB_WORKSPACE" \
+            -DSHIELD=PH60-Multi_V2 \
+            -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_STUDIO_LOCKING=y
+      - name: Collect firmware and effective configuration
+        working-directory: ${{ env.BUILD_ROOT }}
+        run: |
+          mkdir -p artifacts
+          cp build/zephyr/zmk.uf2 "artifacts/PH60-Multi_V2_${{ matrix.name }}.uf2"
+          cp build/zephyr/.config artifacts/effective.config
+          cp manifest-frozen.yml artifacts/
+          printf '%s\n' "$GITHUB_SHA" > artifacts/config-commit.txt
+          sha256sum artifacts/*.uf2 > artifacts/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PH60-Multi_V2-${{ matrix.name }}
+          path: ${{ env.BUILD_ROOT }}/artifacts

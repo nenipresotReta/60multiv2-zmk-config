@@ -9,6 +9,7 @@
 - **主控**：PH-Lite（nRF52840），板级定义在 `boards/arm/ph_lite`
 - **PCB**：PH60 Multi V2，shield 是 `PH60-Multi_V2`，默认物理布局是 `ph60_hhkb_layout`
 - **定位板**：[`hardware/ph60-multi-v2-hhkb-plate.stl`](hardware/ph60-multi-v2-hhkb-plate.stl)（约 285 × 107 × 5 mm）
+- **内壳**：[`hardware/ph60-multi-v2-inner-case.stl`](hardware/ph60-multi-v2-inner-case.stl)，基于 PH60 原版外壳修改，适合大尺寸打印机一体打印（CC BY-NC-SA 4.0，见 [hardware/LICENSE.md](hardware/LICENSE.md)）
 
 配列是标准 HHKB 加 3+1+3 分体空格，以 `PH60-Multi_V2-hhkb.dtsi` 为准。底排两侧各留 1.5u 空位：
 
@@ -94,4 +95,4 @@ hold-tap 预设了 `ht_def`、`ht_fast`、`ht_slow` 和四个用户槽 `ht_user1
 
 ## 许可
 
-沿用上游的 MIT 许可。原始代码版权归 Team PH Design。
+沿用上游的 MIT 许可。原始代码版权归 Team PH Design。`hardware/` 下内壳模型的许可另见 [hardware/LICENSE.md](hardware/LICENSE.md)。

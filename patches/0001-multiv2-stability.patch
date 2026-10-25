@@ -135,7 +135,7 @@ index 2611eee..bf9291d 100644
  
  K_WORK_DEFINE(update_advertising_work, update_advertising_callback);
 diff --git a/app/src/hog.c b/app/src/hog.c
-index aba8cef..2b10fc7 100644
+index aba8cef..e7b06c5 100644
 --- a/app/src/hog.c
 +++ b/app/src/hog.c
 @@ -15,10 +15,9 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
@@ -150,7 +150,7 @@ index aba8cef..2b10fc7 100644
  #if IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)
  #include <zmk/pointing/resolution_multipliers.h>
  #endif // IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)
-@@ -305,115 +304,240 @@ K_THREAD_STACK_DEFINE(hog_q_stack, CONFIG_ZMK_BLE_THREAD_STACK_SIZE);
+@@ -305,115 +304,263 @@ K_THREAD_STACK_DEFINE(hog_q_stack, CONFIG_ZMK_BLE_THREAD_STACK_SIZE);
  
  struct k_work_q hog_work_q;
  
@@ -271,6 +271,9 @@ index aba8cef..2b10fc7 100644
 +    struct k_spinlock enqueue_lock;
 +    struct reliable_report_message pending;
 +    int64_t retry_deadline;
++    int64_t not_ready_deadline;
++    /* Compared only, never dereferenced: the host whose not-ready grace expired. */
++    const struct bt_conn *not_ready_conn;
 +    bool security_requested;
  };
  
@@ -284,6 +287,7 @@ index aba8cef..2b10fc7 100644
 -    struct zmk_hid_consumer_report_body report;
 +#define HOG_REPORT_RETRY_MS 20
 +#define HOG_REPORT_RECOVERY_MS 1000
++#define HOG_REPORT_NOT_READY_MS 5000
  
 -    while (k_msgq_get(&zmk_hog_consumer_msgq, &report, K_NO_WAIT) == 0) {
 -        struct bt_conn *conn = zmk_ble_active_profile_conn();
@@ -325,12 +329,16 @@ index aba8cef..2b10fc7 100644
 +                return;
 +            }
 +            sender->retry_deadline = k_uptime_get() + HOG_REPORT_RECOVERY_MS;
++            sender->not_ready_deadline = k_uptime_get() + HOG_REPORT_NOT_READY_MS;
 +            sender->security_requested = false;
 +        }
 +
 +        struct bt_conn *conn = sender->pending.conn;
 +        struct bt_conn_info info;
 +        if (bt_conn_get_info(conn, &info) || info.state != BT_CONN_STATE_CONNECTED) {
++            if (sender->not_ready_conn == conn) {
++                sender->not_ready_conn = NULL;
++            }
 +            reliable_report_done(sender);
 +            continue;
          }
@@ -353,6 +361,7 @@ index aba8cef..2b10fc7 100644
 -        } else {
 -            zmk_wdt_note_tx_ok();
 +        if (!err) {
++            sender->not_ready_conn = NULL;
 +            reliable_report_done(sender);
 +            continue;
          }
@@ -367,7 +376,21 @@ index aba8cef..2b10fc7 100644
 +            }
 +        }
 +
-+        if (k_uptime_get() >= sender->retry_deadline) {
++        if (err == -EPERM || err == -EINVAL || err == -EAGAIN) {
++            /* The host cannot accept reports yet: not encrypted, not subscribed
++             * or not change-aware. Ending the link cannot clear state the host
++             * never received, so wait for it, then drop without disconnecting.
++             * Later reports to the same host are dropped until one succeeds.
++             */
++            if (sender->not_ready_conn == conn || k_uptime_get() >= sender->not_ready_deadline) {
++                LOG_WRN("HID host not ready (%d); dropping report", err);
++                sender->not_ready_conn = conn;
++                reliable_report_done(sender);
++                continue;
++            }
++            /* Resource failures get a full recovery window once the host is ready. */
++            sender->retry_deadline = k_uptime_get() + HOG_REPORT_RECOVERY_MS;
++        } else if (k_uptime_get() >= sender->retry_deadline) {
 +            int disconnect_err = bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 +            if (!disconnect_err || disconnect_err == -ENOTCONN) {
 +                LOG_WRN("HID notification recovery timed out; ending connection");
@@ -471,7 +494,7 @@ index aba8cef..2b10fc7 100644
  
  #if IS_ENABLED(CONFIG_ZMK_POINTING)
  
-@@ -425,11 +549,12 @@ void send_mouse_report_callback(struct k_work *work) {
+@@ -425,11 +572,12 @@ void send_mouse_report_callback(struct k_work *work) {
      while (k_msgq_get(&zmk_hog_mouse_msgq, &report, K_NO_WAIT) == 0) {
          struct bt_conn *conn = zmk_ble_active_profile_conn();
          if (conn == NULL) {
@@ -486,7 +509,7 @@ index aba8cef..2b10fc7 100644
              .data = &report,
              .len = sizeof(report),
          };
-@@ -439,37 +564,33 @@ void send_mouse_report_callback(struct k_work *work) {
+@@ -439,37 +587,33 @@ void send_mouse_report_callback(struct k_work *work) {
              bt_conn_set_security(conn, BT_SECURITY_L2);
          } else if (err) {
              LOG_DBG("Error notifying %d", err);

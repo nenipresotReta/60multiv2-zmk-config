@@ -10,6 +10,7 @@ static void reset(void) {
     hog_keyboard_work.scheduled=false; hog_consumer_work.scheduled=false; hog_mouse_work.queued=false;
     wdt_feed_work.scheduled=false; feed_count=0; usb_status=USB_DC_CONFIGURED;
     notify_probe=NULL; zmk_wdt_note_tx_ok();
+    keyboard_sender.not_ready_conn=NULL; consumer_sender.not_ready_conn=NULL;
 }
 static void enqueue(struct reliable_report_sender *sender, int keys) {
     if(sender==&keyboard_sender) {
@@ -49,6 +50,43 @@ static void sender_cases(struct reliable_report_sender *sender) {
     step(sender); assert(security_calls==1 && sent_count==0);
     connections[0].encrypted=true; drain(sender); assert(sent_count==1 && sent_keys[0]==0);
     puts("PASS unencrypted state is retained until encryption recovers");
+
+    reset(); connections[0].encrypted=false; enqueue(sender,0);
+    while(now<3000) step(sender);
+    assert(disconnect_calls==0 && sent_count==0 && sender->pending.conn);
+    connections[0].encrypted=true; drain(sender);
+    assert(disconnect_calls==0 && sent_count==1 && sent_keys[0]==0);
+    puts("PASS slow encryption beyond 1 s is waited for, not disconnected");
+
+    for(int e=0;e<3;e++) {
+        reset(); notify_error=(int[]){-EPERM,-EINVAL,-EAGAIN}[e]; failures_left=-1;
+        enqueue(sender,1); while(sender->work->scheduled) { assert(now<=5000); step(sender); }
+        assert(disconnect_calls==0 && sent_count==0 && now==5000 && !sender->tx->outstanding);
+        int before=attempts; enqueue(sender,0); drain(sender);
+        assert(attempts==before+1 && now==5000 && !sender->tx->outstanding);
+        failures_left=0; enqueue(sender,2); drain(sender);
+        assert(disconnect_calls==0 && sent_count==1 && sent_keys[0]==2);
+        failures_left=-1; enqueue(sender,0); step(sender);
+        assert(sender->pending.conn && sender->work->due==now+20);
+        failures_left=0; drain(sender); assert(sent_count==2);
+    }
+    puts("PASS host-not-ready errors drop after grace without disconnecting");
+
+    reset(); notify_error=-EINVAL; failures_left=-1; enqueue(sender,1);
+    while(sender->work->scheduled) { assert(now<=5000); step(sender); }
+    assert(sender->not_ready_conn==&connections[0]);
+    connections[0].state=0; lookup[0]=&connections[2]; enqueue(sender,0); step(sender);
+    assert(sender->pending.conn==&connections[2] && sent_count==0);
+    failures_left=0; drain(sender);
+    assert(disconnect_calls==0 && sent_count==1 && sent_host[0]==2 && !sender->not_ready_conn);
+    puts("PASS not-ready drop state does not carry over to a new connection");
+
+    reset(); connections[0].encrypted=false; enqueue(sender,0);
+    while(now<2000) step(sender);
+    connections[0].encrypted=true; failures_left=-1; notify_error=-ENOMEM;
+    int64_t ready_at=now; drain(sender);
+    assert(disconnect_calls==1 && sent_count==0 && now>=ready_at+1000 && now<ready_at+1040);
+    puts("PASS resource failures after host becomes ready keep the 1 s recovery window");
 
     reset(); failures_left=-1; enqueue(sender,0); enqueue(sender,1); drain(sender);
     assert(disconnect_calls==1 && sent_count==0 && now==1000);

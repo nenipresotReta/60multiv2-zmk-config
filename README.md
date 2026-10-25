@@ -2,7 +2,7 @@
 
 这是 [PH Design](https://github.com/ph-design) 的 ZMK 配置的个人维护分支，只服务于我自己的一把 PH60 Multi V2，配列是 HHKB 加 3+1+3 分体空格。
 
-和上游分开维护，是因为这个配列需要自己的布局和键位，另外这里也在试验一些针对自己使用场景的稳定性改动。这个分支不追求覆盖上游的其他型号。
+和上游分开维护，是因为这个配列需要自己的默认布局和键位，另外这里也在试验一些针对自己使用场景的稳定性改动。这个分支不追求覆盖上游的其他型号。
 
 ## 硬件与配列
 
@@ -17,11 +17,28 @@
 
 ## 按键层
 
+### Base
+
 <img width="1362" height="598" alt="Base 层" src="https://github.com/user-attachments/assets/c2137521-3f77-4bb9-b46c-058cf124d961" />
+
+Caps Lock 位置是 Ctrl。
+
+### Function（按住 Fn）
 
 <img width="1366" height="600" alt="Function 层" src="https://github.com/user-attachments/assets/7a1184f6-beec-4533-adda-ad5f438b82b2" />
 
+方向键、翻页和媒体键沿用 HHKB 习惯。R 是重启键盘；再按住 B 进入 Bluetooth 层。
+
+### Bluetooth（按住 Fn + B）
+
 <img width="1364" height="599" alt="Bluetooth 层" src="https://github.com/user-attachments/assets/14795566-fc27-49b6-a806-88218d4476f1" />
+
+- **1–5**：切换蓝牙配置
+- **`` ` ``**：短按清除当前配对，按住 3 秒清除全部配对
+- **Tab**：USB / 蓝牙切换
+- **R**：进入 UF2 bootloader（刷固件用）
+- **Backspace**：解锁 ZMK Studio
+- **Enter**：软关机
 
 hold-tap 预设了 `ht_def`、`ht_fast`、`ht_slow` 和四个用户槽 `ht_user1`–`ht_user4`，另外留了 5 个 combo 槽位，都可以在 ZMK Studio 里调整。
 
@@ -47,9 +64,9 @@ hold-tap 预设了 `ht_def`、`ht_fast`、`ht_slow` 和四个用户槽 `ht_user1
 ### 配列与键位
 
 - 默认物理布局改为 HHKB（`PH60-Multi_V2.dtsi`）
-- 加入 HHKB 3+1+3 的物理布局；位置映射的前四排与 ANSI 一致，切换布局时键位槽可以沿用
-- 个人键位、hold-tap 参数和唤醒 GPIO 配置
-- 空闲 300 分钟后睡眠；接 USB 供电时不睡眠
+- HHKB 布局的位置映射改为前四排与 ANSI 一致，切换布局时键位槽可以沿用
+- 键位按 HHKB 重排：Base 层 Caps Lock 位置改为 Ctrl；Function 层改为 HHKB 式的方向键、翻页和媒体键；Studio 解锁移到 Bluetooth 层
+- USB 设备名改为 `Nenip Ph60MV2 HHKB`
 
 ### 稳定性修复
 
@@ -62,20 +79,13 @@ hold-tap 预设了 `ht_def`、`ht_fast`、`ht_slow` 和四个用户槽 `ht_user1
 - **看门狗更精确**：只在确实有未发出的报告、且 30 秒没有任何进展时才复位，长按和闲置都不会触发
 - 调整 `zmk_physical_layouts_get_position_map` 中映射表的初始化长度（`memset` 按字节数计算）
 
-完整说明、设计取舍和上机测试步骤见 [MULTIV2-STABILITY.txt](MULTIV2-STABILITY.txt)。
+完整说明和设计取舍见 [MULTIV2-STABILITY.txt](MULTIV2-STABILITY.txt)。
 
 ### 构建
 
 - 实际生效的构建在 `.github/workflows/ble-recovery.yml`，只构建 PH60-Multi_V2 的三个版本
 - `build.yaml` 是上游遗留的构建矩阵，现在没有用到
 - 编译前会先运行 `tests/` 下的故障注入测试：用模拟的 Zephyr / 蓝牙接口，直接编译补丁里的真实代码
-
-## 测试状态
-
-- 故障注入测试：在 CI 上通过
-- 上机测试：**进行中**，间歇性的蓝牙问题是否彻底解决还没有结论
-
-上机重点检查：唤醒后立刻打字是否断连；切换蓝牙配置后立刻打字是否丢键或断连；长按、修饰键、层切换、媒体键、睡眠唤醒和 USB 是否正常。
 
 ## 依赖版本
 

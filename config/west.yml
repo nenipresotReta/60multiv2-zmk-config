@@ -13,6 +13,12 @@ manifest:
       remote: phdesign
       revision: v0.3-lts
       import: app/west.yml
+    # Takes precedence over the moving v0.3_lts branch in zmk's app/west.yml,
+    # whose newer messages need sources the pinned ZMK does not generate.
+    - name: zmk-studio-messages
+      remote: phdesign
+      revision: 8201f24c9149e719e097dfcc92f2c33864c008be
+      path: modules/msgs/zmk-studio-messages
   self:
     path: config
 

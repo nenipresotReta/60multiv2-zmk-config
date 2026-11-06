@@ -37,6 +37,7 @@ Keymap, debounce settings and BLE connection timing are unchanged.
 Build sources:
   Config baseline: 43df72aa4a09b381f6482416e5c31ac15c0308f1
   ph-design/zmk: 76f4effd3d3018c4d2f2568499afb06deac4d3c6
+  ph-design/zmk-studio-messages: 8201f24c9149e719e097dfcc92f2c33864c008be
   Patch: patches/0001-multiv2-stability.patch
 Each artifact includes its config commit, frozen dependency manifest, effective
 Kconfig and SHA-256 checksum. Both the default workflow and direct builds use

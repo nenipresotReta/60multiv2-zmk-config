@@ -92,7 +92,7 @@ hold-tap 预设了 `ht_def`、`ht_fast`、`ht_slow` 和四个用户槽 `ht_user1
 
 ## 依赖版本
 
-固件基于 `ph-design/zmk@76f4eff`（Zephyr `v3.5.0+zmk-fixes`），版本锁定在 `.github/workflows/ble-recovery.yml` 的 `ZMK_REVISION`。
+固件基于 `ph-design/zmk@76f4eff`（Zephyr `v3.5.0+zmk-fixes`），版本锁定在 `.github/workflows/ble-recovery.yml` 的 `ZMK_REVISION`。`zmk-studio-messages` 锁定在 `config/west.yml`（`8201f24`）。
 
 ## 许可
 

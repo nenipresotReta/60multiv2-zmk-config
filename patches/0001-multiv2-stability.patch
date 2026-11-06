@@ -55,7 +55,7 @@ index afe414a..673a337 100644
  void zmk_wdt_note_tx_fail(void);
  
 diff --git a/app/src/ble.c b/app/src/ble.c
-index 2611eee..bf9291d 100644
+index 2611eee..91cda00 100644
 --- a/app/src/ble.c
 +++ b/app/src/ble.c
 @@ -13,6 +13,7 @@
@@ -89,7 +89,7 @@ index 2611eee..bf9291d 100644
      int err = 0;
      bt_addr_le_t *addr;
      struct bt_conn *conn;
-@@ -220,6 +221,44 @@ int update_advertising(void) {
+@@ -220,6 +221,46 @@ int update_advertising(void) {
      return 0;
  };
  
@@ -111,10 +111,12 @@ index 2611eee..bf9291d 100644
 +    }
 +
 +    int err = update_advertising_once();
-+    if (err == -ENOMEM || err == -ENOBUFS || err == -EAGAIN || err == -EBUSY) {
++    if (err == -ENOMEM || err == -ENOBUFS || err == -EAGAIN || err == -EBUSY || err == -EIO) {
 +        // ONE_TIME advertising is not restarted by Zephyr when the last
 +        // reference to a disconnected connection is released. That reference
 +        // can outlive disconnected(), so keep trying after resources recover.
++        // Controller memory shortages reach us as -EIO. Without advertising
++        // the host cannot reconnect, so no later event would repair them.
 +        int delay = atomic_get(&advertising_retry_delay_ms);
 +        atomic_set(&advertising_retry_delay_ms, MIN(delay * 2, ADV_RETRY_MAX_MS));
 +        k_work_schedule(&advertising_retry_work, K_MSEC(delay));
@@ -135,7 +137,7 @@ index 2611eee..bf9291d 100644
  
  K_WORK_DEFINE(update_advertising_work, update_advertising_callback);
 diff --git a/app/src/hog.c b/app/src/hog.c
-index aba8cef..e7b06c5 100644
+index aba8cef..2a23af5 100644
 --- a/app/src/hog.c
 +++ b/app/src/hog.c
 @@ -15,10 +15,9 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
@@ -150,7 +152,7 @@ index aba8cef..e7b06c5 100644
  #if IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)
  #include <zmk/pointing/resolution_multipliers.h>
  #endif // IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)
-@@ -305,115 +304,263 @@ K_THREAD_STACK_DEFINE(hog_q_stack, CONFIG_ZMK_BLE_THREAD_STACK_SIZE);
+@@ -305,115 +304,254 @@ K_THREAD_STACK_DEFINE(hog_q_stack, CONFIG_ZMK_BLE_THREAD_STACK_SIZE);
  
  struct k_work_q hog_work_q;
  
@@ -272,8 +274,6 @@ index aba8cef..e7b06c5 100644
 +    struct reliable_report_message pending;
 +    int64_t retry_deadline;
 +    int64_t not_ready_deadline;
-+    /* Compared only, never dereferenced: the host whose not-ready grace expired. */
-+    const struct bt_conn *not_ready_conn;
 +    bool security_requested;
  };
  
@@ -336,9 +336,6 @@ index aba8cef..e7b06c5 100644
 +        struct bt_conn *conn = sender->pending.conn;
 +        struct bt_conn_info info;
 +        if (bt_conn_get_info(conn, &info) || info.state != BT_CONN_STATE_CONNECTED) {
-+            if (sender->not_ready_conn == conn) {
-+                sender->not_ready_conn = NULL;
-+            }
 +            reliable_report_done(sender);
 +            continue;
          }
@@ -361,7 +358,6 @@ index aba8cef..e7b06c5 100644
 -        } else {
 -            zmk_wdt_note_tx_ok();
 +        if (!err) {
-+            sender->not_ready_conn = NULL;
 +            reliable_report_done(sender);
 +            continue;
          }
@@ -376,24 +372,21 @@ index aba8cef..e7b06c5 100644
 +            }
 +        }
 +
++        int64_t deadline = sender->retry_deadline;
 +        if (err == -EPERM || err == -EINVAL || err == -EAGAIN) {
 +            /* The host cannot accept reports yet: not encrypted, not subscribed
-+             * or not change-aware. Ending the link cannot clear state the host
-+             * never received, so wait for it, then drop without disconnecting.
-+             * Later reports to the same host are dropped until one succeeds.
++             * or not change-aware. Give it time to finish setting up. A link that
++             * stays in this state would lose every report with no later event to
++             * repair it, so end it and let the host reconnect.
 +             */
-+            if (sender->not_ready_conn == conn || k_uptime_get() >= sender->not_ready_deadline) {
-+                LOG_WRN("HID host not ready (%d); dropping report", err);
-+                sender->not_ready_conn = conn;
-+                reliable_report_done(sender);
-+                continue;
-+            }
++            deadline = sender->not_ready_deadline;
 +            /* Resource failures get a full recovery window once the host is ready. */
 +            sender->retry_deadline = k_uptime_get() + HOG_REPORT_RECOVERY_MS;
-+        } else if (k_uptime_get() >= sender->retry_deadline) {
++        }
++        if (k_uptime_get() >= deadline) {
 +            int disconnect_err = bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 +            if (!disconnect_err || disconnect_err == -ENOTCONN) {
-+                LOG_WRN("HID notification recovery timed out; ending connection");
++                LOG_WRN("HID notification recovery timed out (%d); ending connection", err);
 +                reliable_report_done(sender);
 +                continue;
 +            }
@@ -494,7 +487,7 @@ index aba8cef..e7b06c5 100644
  
  #if IS_ENABLED(CONFIG_ZMK_POINTING)
  
-@@ -425,11 +572,12 @@ void send_mouse_report_callback(struct k_work *work) {
+@@ -425,11 +563,12 @@ void send_mouse_report_callback(struct k_work *work) {
      while (k_msgq_get(&zmk_hog_mouse_msgq, &report, K_NO_WAIT) == 0) {
          struct bt_conn *conn = zmk_ble_active_profile_conn();
          if (conn == NULL) {
@@ -509,7 +502,7 @@ index aba8cef..e7b06c5 100644
              .data = &report,
              .len = sizeof(report),
          };
-@@ -439,37 +587,33 @@ void send_mouse_report_callback(struct k_work *work) {
+@@ -439,37 +578,33 @@ void send_mouse_report_callback(struct k_work *work) {
              bt_conn_set_security(conn, BT_SECURITY_L2);
          } else if (err) {
              LOG_DBG("Error notifying %d", err);

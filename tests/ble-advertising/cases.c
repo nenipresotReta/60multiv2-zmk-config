@@ -71,7 +71,7 @@ int main(void) {
     assert(advertising_on && advertising_retry_delay_ms == 100 && !advertising_retry_work.scheduled);
     puts("PASS persistent shortage uses bounded exponential backoff and resets after recovery");
 
-    const int transient_errors[] = {-ENOMEM, -ENOBUFS, -EAGAIN, -EBUSY};
+    const int transient_errors[] = {-ENOMEM, -ENOBUFS, -EAGAIN, -EBUSY, -EIO};
     for (unsigned i = 0; i < ARRAY_SIZE(transient_errors); i++) {
         reset(); start_error = transient_errors[i];
         assert(update_advertising() == transient_errors[i]);
@@ -81,7 +81,7 @@ int main(void) {
     }
     puts("PASS transient connection/buffer/controller shortages are retried");
 
-    const int permanent_errors[] = {-EINVAL, -ENOTSUP, -EIO};
+    const int permanent_errors[] = {-EINVAL, -ENOTSUP};
     for (unsigned i = 0; i < ARRAY_SIZE(permanent_errors); i++) {
         reset(); start_error = permanent_errors[i];
         assert(update_advertising() == permanent_errors[i]);

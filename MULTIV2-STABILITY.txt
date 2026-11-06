@@ -17,11 +17,11 @@ Changes:
     to their original connection. Retry every 20 ms; request a disconnect after
     1 s of failure so the host can clear stale pressed state. If disconnect also
     fails, retain the report for retry. Use encrypted HID value attributes.
-  - Do not disconnect when the host is not ready for reports (not encrypted,
-    not subscribed or not change-aware: -EPERM/-EINVAL/-EAGAIN). Wait up to
-    5 s, then drop the report and later ones to that host until a send
-    succeeds. The 1 s disconnect applies only to other send failures, timed
-    from when the host was last not ready.
+  - Allow the host 5 s rather than 1 s to become ready for reports (encrypted,
+    subscribed and change-aware: -EPERM/-EINVAL/-EAGAIN otherwise). A link still
+    not ready after that is ended, so the host can reconnect instead of losing
+    every report. The 1 s disconnect applies to other send failures, timed from
+    when the host was last not ready.
   - Detect outstanding sends with no progress, including a blocked send call.
     Normal held keys have no pending report after their press is accepted;
     there is no forced key-release timer and normal long holds remain supported.
@@ -29,8 +29,9 @@ Changes:
     the latest physical state through the normal position event path. A complete
     very short tap during overflow can still be lost, but a final release is
     no longer silently discarded. Layout changes require a quiescent keyboard.
-  - Retry advertising after temporary Bluetooth resource errors, with bounded
-    backoff, using the latest selected profile.
+  - Retry advertising after temporary Bluetooth resource errors, including
+    controller memory shortages reported as -EIO, with bounded backoff, using
+    the latest selected profile.
 Keymap, debounce settings and BLE connection timing are unchanged.
 
 Build sources:

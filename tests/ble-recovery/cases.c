@@ -27,7 +27,7 @@ static void step(struct reliable_report_sender *sender) {
     work->scheduled=false; work->work.handler(&work->work);
 }
 static void drain(struct reliable_report_sender *sender) {
-    for(int i=0;sender->work->scheduled;i++) { assert(i<200); step(sender); }
+    for(int i=0;sender->work->scheduled;i++) { assert(i<500); step(sender); }
 }
 static void sender_cases(struct reliable_report_sender *sender) {
     reset(); enqueue(sender,1); enqueue(sender,0); drain(sender);
@@ -83,16 +83,16 @@ static void sender_cases(struct reliable_report_sender *sender) {
     while(now<2000) step(sender);
     connections[0].encrypted=true; failures_left=-1; notify_error=-ENOMEM;
     int64_t ready_at=now; drain(sender);
-    assert(disconnect_calls==1 && sent_count==0 && now>=ready_at+1000 && now<ready_at+1040);
-    puts("PASS resource failures after host becomes ready keep the 1 s recovery window");
+    assert(disconnect_calls==1 && sent_count==0 && now>=ready_at+4000 && now<ready_at+4040);
+    puts("PASS resource failures after host becomes ready keep the 4 s recovery window");
 
     reset(); failures_left=-1; enqueue(sender,0); enqueue(sender,1); drain(sender);
-    assert(disconnect_calls==1 && sent_count==0 && now==1000);
+    assert(disconnect_calls==1 && sent_count==0 && now==4000);
     assert(connections[0].state==BT_CONN_STATE_DISCONNECTING);
     puts("PASS permanent failure disconnects before obsolete states can be sent");
 
     reset(); failures_left=-1; disconnect_error=-ENOMEM; enqueue(sender,0);
-    for(int i=0;i<51;i++) step(sender);
+    for(int i=0;i<201;i++) step(sender);
     assert(disconnect_calls==1 && sender->pending.conn);
     failures_left=0; drain(sender); assert(sent_count==1 && sent_keys[0]==0);
     puts("PASS failed disconnect retains final release");

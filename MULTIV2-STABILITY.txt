@@ -15,13 +15,18 @@ These are normal application UF2 files, not settings-reset images.
 Changes:
   - Keep keyboard and consumer reports in order across failed BLE sends, tied
     to their original connection. Retry every 20 ms; request a disconnect after
-    1 s of failure so the host can clear stale pressed state. If disconnect also
-    fails, retain the report for retry. Use encrypted HID value attributes.
+    4 s of persistent failure (matching the 4000 ms BLE supervision timeout) so
+    short RF stalls can recover without prematurely disconnecting and discarding
+    a pending key-up report. If disconnect also fails, retain the report for
+    retry. Use encrypted HID value attributes.
   - Allow the host 5 s rather than 1 s to become ready for reports (encrypted,
     subscribed and change-aware: -EPERM/-EINVAL/-EAGAIN otherwise). A link still
     not ready after that is ended, so the host can reconnect instead of losing
-    every report. The 1 s disconnect applies to other send failures, timed from
+    every report. The 4 s disconnect applies to other send failures, timed from
     when the host was last not ready.
+  - Clear local HID keyboard/consumer/mouse state immediately when BLE
+    disconnects while staying on the same profile (when USB is not ready), so
+    stale pressed key bits cannot persist across reconnects.
   - Detect outstanding sends with no progress, including a blocked send call.
     Normal held keys have no pending report after their press is accepted;
     there is no forced key-release timer and normal long holds remain supported.
@@ -32,7 +37,15 @@ Changes:
   - Retry advertising after temporary Bluetooth resource errors, including
     controller memory shortages reported as -EIO, with bounded backoff, using
     the latest selected profile.
-Keymap, debounce settings and BLE connection timing are unchanged.
+  - Backport upstream Studio combo settings finalization (c61fe0b / 8fb6209) so
+    reserved Studio combo slots initialize cleanly on boot and reload.
+  - Update PH60-Multi_V2.conf matrix and BLE stack settings: increase debounce
+    press to 5 ms and add 10 us column-to-row settle delays to eliminate col2row
+    diode RC discharge crosstalk; enlarge heap (32 KB), system workqueue stack
+    (4 KB), HOG BLE thread stack (2 KB), Studio RPC stack (8 KB), and L2CAP/ACL
+    TX buffers (10); restore 2M PHY, reduce peripheral preferred latency to 6,
+    and allow 500 ppm LFCLK tolerance.
+Keymap is unchanged.
 
 Build sources:
   Config baseline: 43df72aa4a09b381f6482416e5c31ac15c0308f1

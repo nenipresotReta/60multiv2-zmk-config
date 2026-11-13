@@ -22,6 +22,16 @@ index 6bcdffe..fbf7884 100644
  
  config ZMK_SLEEP
      bool "Enable deep sleep support"
+diff --git a/app/include/zmk/combos.h b/app/include/zmk/combos.h
+index 50a087b..eb6f71f 100644
+--- a/app/include/zmk/combos.h
++++ b/app/include/zmk/combos.h
+@@ -53,3 +53,5 @@ int zmk_combo_save_all(void);
+ int zmk_combo_settings_reset(void);
+ 
+ int zmk_combo_reload_from_settings(void);
++
++void zmk_combo_finalize_settings(void);
 diff --git a/app/include/zmk/hog.h b/app/include/zmk/hog.h
 index 0b79dec..18ece6b 100644
 --- a/app/include/zmk/hog.h
@@ -136,8 +146,171 @@ index 2611eee..91cda00 100644
  static void update_advertising_callback(struct k_work *work) { update_advertising(); }
  
  K_WORK_DEFINE(update_advertising_work, update_advertising_callback);
+diff --git a/app/src/combo.c b/app/src/combo.c
+index 69cffa1..64c893c 100644
+--- a/app/src/combo.c
++++ b/app/src/combo.c
+@@ -835,7 +835,7 @@ int zmk_combo_reload_from_settings(void) {
+     }
+ 
+     int rc = settings_load_subtree("combo/cfg");
+-    combo_cfg_dirty = true;
++    zmk_combo_finalize_settings();
+     return rc;
+ }
+ 
+@@ -845,30 +845,32 @@ static void combo_apply_blob(uint16_t index, const struct combo_settings_blob *b
+         return;
+     }
+ 
+-    struct combo_override *ov = &combo_overrides[index];
+-    ov->present = true;
+-    ov->cfg = (struct zmk_combo_pub_config){
+-        .timeout_ms = blob->timeout_ms,
+-        .require_prior_idle_ms = blob->require_prior_idle_ms,
+-        .layer_mask = blob->layer_mask,
+-        .slow_release = blob->slow_release != 0,
++    struct combo_override next = {
++        .present = true,
++        .cfg =
++            {
++                .timeout_ms = blob->timeout_ms,
++                .require_prior_idle_ms = blob->require_prior_idle_ms,
++                .layer_mask = blob->layer_mask,
++                .slow_release = blob->slow_release != 0,
++            },
+     };
+ 
+     if (blob->version < 2) {
++        combo_overrides[index] = next;
+         return;
+     }
+ 
+     if (blob->key_position_len > MAX_COMBO_KEYS) {
+-        LOG_WRN("Discarding combo/cfg/%u with %d keys > max %d", index,
+-                blob->key_position_len, MAX_COMBO_KEYS);
++        LOG_WRN("Discarding combo/cfg/%u with %d keys > max %d", index, blob->key_position_len,
++                MAX_COMBO_KEYS);
+         return;
+     }
+ 
+-    const char *behavior_name =
+-        zmk_behavior_find_behavior_name_from_local_id(blob->behavior_local_id);
+-    if (!behavior_name) {
+-        LOG_WRN("Discarding combo/cfg/%u with unknown behavior local_id %u", index,
+-                blob->behavior_local_id);
++    if (blob->key_position_len == 0) {
++        next.positions_present = true;
++        combo_overrides[index] = next;
++        combo_cfg_dirty = true;
+         return;
+     }
+ 
+@@ -880,17 +882,40 @@ static void combo_apply_blob(uint16_t index, const struct combo_settings_blob *b
+         }
+     }
+ 
+-    ov->key_position_len = blob->key_position_len;
++    next.key_position_len = blob->key_position_len;
+     for (uint8_t p = 0; p < blob->key_position_len; p++) {
+-        ov->key_positions[p] = blob->key_positions[p];
++        next.key_positions[p] = blob->key_positions[p];
+     }
+-    ov->behavior = (struct zmk_behavior_binding){
+-        .behavior_dev = behavior_name,
++    next.behavior = (struct zmk_behavior_binding){
+         .local_id = blob->behavior_local_id,
+         .param1 = blob->param1,
+         .param2 = blob->param2,
+     };
+-    ov->positions_present = true;
++    next.positions_present = true;
++    combo_overrides[index] = next;
++    combo_cfg_dirty = true;
++}
++
++void zmk_combo_finalize_settings(void) {
++    for (uint16_t i = 0; i < ARRAY_SIZE(combos); i++) {
++        struct combo_override *ov = &combo_overrides[i];
++        if (!ov->present || !ov->positions_present || ov->key_position_len == 0 ||
++            ov->behavior.behavior_dev) {
++            continue;
++        }
++
++        const char *behavior_name =
++            zmk_behavior_find_behavior_name_from_local_id(ov->behavior.local_id);
++        if (!behavior_name) {
++            LOG_WRN("Discarding combo/cfg/%u with unknown behavior local_id %u", i,
++                    ov->behavior.local_id);
++            combo_clear_override(i);
++            continue;
++        }
++
++        ov->behavior.behavior_dev = behavior_name;
++    }
++
+     combo_cfg_dirty = true;
+ }
+ 
+@@ -941,4 +966,5 @@ size_t zmk_combo_get_key_positions_at_idx(uint16_t index, const int32_t **positi
+ int zmk_combo_save_all(void) { return 0; }
+ int zmk_combo_settings_reset(void) { return 0; }
+ int zmk_combo_reload_from_settings(void) { return 0; }
++void zmk_combo_finalize_settings(void) {}
+ #endif
+diff --git a/app/src/endpoints.c b/app/src/endpoints.c
+index 9f22ce5..b1aec52 100644
+--- a/app/src/endpoints.c
++++ b/app/src/endpoints.c
+@@ -28,6 +28,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+     COND_CODE_1(IS_ENABLED(CONFIG_ZMK_BLE), (ZMK_TRANSPORT_BLE), (ZMK_TRANSPORT_USB))
+ 
+ static struct zmk_endpoint_instance current_instance = {};
++static bool current_ble_connected = false;
+ static enum zmk_transport preferred_transport =
+     ZMK_TRANSPORT_USB; /* Used if multiple endpoints are ready */
+ 
+@@ -335,6 +336,7 @@ static int zmk_endpoints_init(void) {
+ #endif
+ 
+     current_instance = get_selected_instance();
++    current_ble_connected = (current_instance.transport == ZMK_TRANSPORT_BLE) && is_ble_ready();
+ 
+     return 0;
+ }
+@@ -352,18 +354,30 @@ void zmk_endpoints_clear_current(void) {
+ 
+ static void update_current_endpoint(void) {
+     struct zmk_endpoint_instance new_instance = get_selected_instance();
++    bool ble_ready = is_ble_ready();
+ 
+     if (!zmk_endpoint_instance_eq(new_instance, current_instance)) {
+         // Cancel all current keypresses so keys don't stay held on the old endpoint.
+         zmk_endpoints_clear_current();
+ 
+         current_instance = new_instance;
++        current_ble_connected = (current_instance.transport == ZMK_TRANSPORT_BLE) && ble_ready;
+ 
+         char endpoint_str[ZMK_ENDPOINT_STR_LEN];
+         zmk_endpoint_instance_to_str(current_instance, endpoint_str, sizeof(endpoint_str));
+         LOG_INF("Endpoint changed: %s", endpoint_str);
+ 
+         raise_zmk_endpoint_changed((struct zmk_endpoint_changed){.endpoint = current_instance});
++    } else if (current_instance.transport == ZMK_TRANSPORT_BLE) {
++        if (current_ble_connected && !ble_ready) {
++            // Clear stale held keys locally when BLE disconnects while staying on the same profile.
++            zmk_hid_keyboard_clear();
++            zmk_hid_consumer_clear();
++#if IS_ENABLED(CONFIG_ZMK_POINTING)
++            zmk_hid_mouse_clear();
++#endif // IS_ENABLED(CONFIG_ZMK_POINTING)
++        }
++        current_ble_connected = ble_ready;
+     }
+ }
+ 
 diff --git a/app/src/hog.c b/app/src/hog.c
-index aba8cef..2a23af5 100644
+index aba8cef..a995669 100644
 --- a/app/src/hog.c
 +++ b/app/src/hog.c
 @@ -15,10 +15,9 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
@@ -286,7 +459,7 @@ index aba8cef..2a23af5 100644
 -void send_consumer_report_callback(struct k_work *work) {
 -    struct zmk_hid_consumer_report_body report;
 +#define HOG_REPORT_RETRY_MS 20
-+#define HOG_REPORT_RECOVERY_MS 1000
++#define HOG_REPORT_RECOVERY_MS 4000
 +#define HOG_REPORT_NOT_READY_MS 5000
  
 -    while (k_msgq_get(&zmk_hog_consumer_msgq, &report, K_NO_WAIT) == 0) {
@@ -552,6 +725,31 @@ index aba8cef..2a23af5 100644
  #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
  
  static int zmk_hog_init(void) {
+diff --git a/app/src/main.c b/app/src/main.c
+index 0f77382..1e895d3 100644
+--- a/app/src/main.c
++++ b/app/src/main.c
+@@ -12,6 +12,10 @@
+ #include <zephyr/logging/log.h>
+ LOG_MODULE_REGISTER(zmk, CONFIG_ZMK_LOG_LEVEL);
+ 
++#if IS_ENABLED(CONFIG_ZMK_STUDIO)
++#include <zmk/combos.h>
++#endif
++
+ #if IS_ENABLED(CONFIG_ZMK_DISPLAY)
+ 
+ #include <zmk/display.h>
+@@ -25,6 +29,9 @@ int main(void) {
+ #if IS_ENABLED(CONFIG_SETTINGS)
+     settings_subsys_init();
+     settings_load();
++#if IS_ENABLED(CONFIG_ZMK_STUDIO)
++    zmk_combo_finalize_settings();
++#endif
+ #endif
+ 
+ #ifdef CONFIG_ZMK_DISPLAY
 diff --git a/app/src/physical_layouts.c b/app/src/physical_layouts.c
 index 8d38430..2103177 100644
 --- a/app/src/physical_layouts.c
